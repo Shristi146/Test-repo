@@ -183,27 +183,59 @@ def analyze_sentiment(text: str):
             "score": 0.0,
             "note": f"Sentiment model unavailable: {str(exc)[:180]}"
         }
-
-
 FILLERS_BY_LANGUAGE = {
-    "english": ["um", "uh", "erm", "you know", "sort of", "kind of", "i mean"],
-    "hindi": ["मतलब", "अम्म", "उह", "यानी"],
-    "spanish": ["eh", "este", "o sea", "pues"],
-    "french": ["euh", "ben", "en fait"],
-    "german": ["äh", "ähm", "also"],
-    "portuguese": ["é", "tipo", "né"],
+    "english": [
+        "um", "uh", "erm", "umm", "uhh",
+        "you know", "i mean", "kind of", "sort of",
+        "basically", "actually", "literally"
+    ],
+    "hindi": [
+        "मतलब", "अम्म", "उह", "यानी"
+    ],
+    "spanish": [
+        "eh", "este", "o sea", "pues"
+    ],
+    "french": [
+        "euh", "ben", "en fait"
+    ],
+    "german": [
+        "äh", "ähm", "also"
+    ],
+    "portuguese": [
+        "é", "tipo", "né"
+    ],
 }
 
 
 def count_fillers(text: str, language_name: str):
-    """Count listed filler phrases with case-insensitive word boundaries."""
-    candidates = FILLERS_BY_LANGUAGE.get(language_name.lower(), FILLERS_BY_LANGUAGE["english"])
+    """
+    Count possible filler words and phrases in a transcript.
+
+    This is an approximate transcript-based count. It cannot reliably
+    distinguish a filler from a word used intentionally in a sentence.
+    """
+    language = language_name.lower().strip()
+    candidates = FILLERS_BY_LANGUAGE.get(
+        language,
+        FILLERS_BY_LANGUAGE["english"]
+    )
+
+    text_lower = text.lower()
     counts = {}
-    for filler in candidates:
-        pattern = r"(?<!\w)" + re.escape(filler.lower()) + r"(?!\w)"
-        count = len(re.findall(pattern, text.lower()))
+
+    # Check longer phrases first to reduce overlapping matches.
+    for filler in sorted(candidates, key=len, reverse=True):
+        pattern = (
+            r"(?<!\w)"
+            + re.escape(filler.lower())
+            + r"(?!\w)"
+        )
+
+        count = len(re.findall(pattern, text_lower))
+
         if count:
             counts[filler] = count
+
     return counts
 
 
@@ -305,8 +337,18 @@ def score_content(answer: str, expected_points_text: str):
 
 
 def score_speech(filler_count: int, wpm: float, word_count: int):
-    # Transparent practice bands. Filler frequency is normalized by transcript length.
-    if 110 <= wpm <= 160:
+    """
+    Calculate approximate practice indicators for speaking pace
+    and detected filler frequency.
+
+    These are heuristic indicators, not scientifically validated
+    measures of interview performance.
+    """
+
+    # Speaking pace indicator
+    if word_count <= 0 or wpm <= 0:
+        pace_score = 0.0
+    elif 110 <= wpm <= 160:
         pace_score = 100.0
     elif 90 <= wpm < 110 or 160 < wpm <= 180:
         pace_score = 75.0
@@ -314,18 +356,38 @@ def score_speech(filler_count: int, wpm: float, word_count: int):
         pace_score = 50.0
     else:
         pace_score = 25.0
-    rate = (filler_count / max(1, word_count)) * 100
-    if rate <= 1:
+
+    # Detected filler frequency per 100 transcript words
+    filler_rate = (
+        filler_count / max(1, word_count)
+    ) * 100
+
+    # Filler-control practice indicator
+    if word_count <= 0:
+        filler_score = 0.0
+    elif filler_rate <= 1:
         filler_score = 100.0
-    elif rate <= 3:
+    elif filler_rate <= 3:
         filler_score = 85.0
-    elif rate <= 5:
+    elif filler_rate <= 5:
         filler_score = 70.0
-    elif rate <= 8:
+    elif filler_rate <= 8:
         filler_score = 50.0
     else:
         filler_score = 30.0
-    return 0.7 * pace_score + 0.3 * filler_score, pace_score, filler_score, rate
+
+    # A practice indicator only; not an overall interview score.
+    combined_score = (
+        0.7 * pace_score
+        + 0.3 * filler_score
+    )
+
+    return (
+        combined_score,
+        pace_score,
+        filler_score,
+        filler_rate
+    )
 
 
 def build_recommendations(transcript, wpm, filler_result, content_score, missing_points, language_code):
@@ -363,29 +425,64 @@ def _pdf_safe_text(value):
 
 
 def _pdf_multicell(pdf, text, line_height=6):
-    """Render text safely, splitting long unbroken tokens before FPDF wraps them."""
+    """
+    Safely write wrapped text into the PDF.
+
+    Converts unsupported characters for built-in Helvetica and
+    splits long unbroken tokens to reduce FPDF wrapping errors.
+    """
     text = _pdf_safe_text(text)
-    usable_width = pdf.w - pdf.l_margin - pdf.r_margin
-    lines = []
+
+    usable_width = (
+        pdf.w
+        - pdf.l_margin
+        - pdf.r_margin
+    )
+
+    if usable_width <= 0:
+        raise ValueError("PDF has no usable horizontal writing space.")
+
+    wrapped_lines = []
+
     for original_line in text.splitlines() or [""]:
         words = original_line.split()
         output_words = []
+
         for word in words:
+            # Split tokens that are wider than the available line.
             chunks = []
-            while word and pdf.get_string_width(word) > usable_width:
+
+            while (
+                word
+                and pdf.get_string_width(word) > usable_width
+            ):
                 cut = 1
-                while cut < len(word) and pdf.get_string_width(word[:cut + 1]) <= usable_width:
+
+                while (
+                    cut < len(word)
+                    and pdf.get_string_width(word[:cut + 1])
+                    <= usable_width
+                ):
                     cut += 1
+
                 chunks.append(word[:cut])
                 word = word[cut:]
+
             if word:
                 chunks.append(word)
+
             output_words.extend(chunks or [""])
-        lines.append(" ".join(output_words))
+
+        wrapped_lines.append(" ".join(output_words))
+
     pdf.set_x(pdf.l_margin)
-    pdf.multi_cell(usable_width, line_height, "\n".join(lines))
 
-
+    pdf.multi_cell(
+        w=usable_width,
+        h=line_height,
+        text="\n".join(wrapped_lines)
+    )
+    
 class InterviewReportPDF(FPDF):
     def header(self):
         if self.page_no() > 1:
@@ -652,6 +749,7 @@ if uploaded_video is not None:
                 st.warning("The analysis completed, but the PDF report could not be generated. Your on-screen results are still available.")
                 st.caption(f"PDF export detail: {pdf_exc}")
             st.download_button(
+        
                 "Download transcript (TXT)",
                 data=transcript.strip() + "\n",
                 file_name="interview_transcript.txt",
